@@ -1,5 +1,8 @@
 # Strapi MCP Server
 
+> [!NOTE]
+> This is a refactored version of the original Strapi MCP server, using a higher-level SDK abstraction and optimized prompts for better AI interactions.
+
 A Model Context Protocol server for interacting with Strapi CMS. This server enables AI assistants to interact with your Strapi instance through a standardized interface, supporting content types and REST API operations.
 
 ## Features
@@ -22,11 +25,7 @@ You can use this server directly with npx in your Claude Desktop configuration:
   "mcpServers": {
     "strapi": {
       "command": "npx",
-      "args": ["-y", "@bschauer/strapi-mcp-server"],
-      "env": {
-        "API_URL": "http://localhost:1337",
-        "JWT": "your-jwt-token"
-      }
+      "args": ["-y", "@bschauer/strapi-mcp-server"]
     }
   }
 }
