@@ -1,14 +1,8 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-    CallToolRequestSchema,
-    ListToolsRequestSchema,
-    ListPromptsRequestSchema,
-    GetPromptRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
+import qs from 'qs';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
 import sharp from 'sharp';
@@ -16,6 +10,7 @@ import { CONNECT_TO_STRAPI_CONTENT } from './promts/connect.js';
 import { readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { z } from "zod";
 
 // Read config file
 const CONFIG_PATH = join(homedir(), '.mcp', 'strapi-mcp-server.config.json');
@@ -34,18 +29,10 @@ try {
 }
 
 // Create server instance
-const server = new Server(
-    {
-        name: "strapi-mcp",
-        version: "1.0.0",
-    },
-    {
-        capabilities: {
-            tools: {},
-            prompts: {},
-        },
-    }
-);
+const server = new McpServer({
+    name: "strapi-mcp",
+    version: "1.0.0"
+});
 
 // Helper function to get server config
 function getServerConfig(serverName: string): { API_URL: string, JWT: string } {
@@ -94,59 +81,6 @@ function getServerConfig(serverName: string): { API_URL: string, JWT: string } {
     };
 }
 
-// Define prompt types
-interface PromptArgument {
-    name: string;
-    description: string;
-    required: boolean;
-}
-
-interface Prompt {
-    name: string;
-    description: string;
-    arguments: PromptArgument[];
-}
-
-// Define prompts
-const PROMPTS: Record<string, Prompt> = {
-    "Connect to Strapi": {
-        name: "Connect to Strapi",
-        description: "Start a conversation with an expert who understands both Strapi v4 and v5, their differences, and best practices",
-        arguments: []
-    }
-};
-
-// List available prompts
-server.setRequestHandler(ListPromptsRequestSchema, async () => {
-    return {
-        prompts: Object.values(PROMPTS)
-    };
-});
-
-// Get specific prompt
-server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-    const prompt = PROMPTS[request.params.name];
-    if (!prompt) {
-        throw new Error(`Prompt not found: ${request.params.name}`);
-    }
-
-    if (request.params.name === "Connect to Strapi") {
-        return {
-            messages: [
-                {
-                    role: "assistant",
-                    content: {
-                        type: "text",
-                        text: CONNECT_TO_STRAPI_CONTENT
-                    }
-                }
-            ]
-        };
-    }
-
-    throw new Error("Prompt implementation not found");
-});
-
 // Helper function for making Strapi API requests
 async function makeStrapiRequest(serverName: string, endpoint: string, params?: Record<string, string>): Promise<any> {
     const serverConfig = getServerConfig(serverName);
@@ -169,6 +103,263 @@ async function makeStrapiRequest(serverName: string, endpoint: string, params?: 
         throw error;
     }
 }
+
+// List available prompts
+server.prompt(
+    "Connect to Strapi",
+    "Start a conversation with an expert who understands both Strapi v4 and v5",
+    async () => {
+        return {
+            messages: [
+                {
+                    role: "assistant",
+                    content: {
+                        type: "text",
+                        text: CONNECT_TO_STRAPI_CONTENT
+                    }
+                }
+            ]
+        };
+    }
+);
+
+// Define tools using server.tool()
+server.tool(
+    "strapi_list_servers",
+    "Lists all available Strapi servers and their configurations, including server names and API URLs. If no servers are configured, provides a detailed setup guide with step-by-step instructions for configuration. Helps manage multiple Strapi instances through a centralized configuration.",
+    {},
+    async () => {
+        if (Object.keys(config).length === 0) {
+            const exampleConfig = {
+                "myserver": {
+                    "api_url": "http://localhost:1337",
+                    "api_key": "your-jwt-token-from-strapi-admin"
+                }
+            };
+
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        error: "No servers configured",
+                        help: {
+                            message: "No server configuration found. Please create a configuration file.",
+                            config_path: CONFIG_PATH,
+                            example_config: exampleConfig,
+                            setup_steps: [
+                                "Create the .mcp directory: mkdir -p ~/.mcp",
+                                "Create the config file: touch ~/.mcp/strapi-mcp-server.config.json",
+                                "Add your server configuration using the example above",
+                                "Get your JWT token from Strapi Admin Panel > Settings > API Tokens",
+                                "Make sure the file permissions are secure: chmod 600 ~/.mcp/strapi-mcp-server.config.json"
+                            ]
+                        }
+                    }, null, 2)
+                }]
+            };
+        }
+
+        const servers = Object.keys(config).map(serverName => ({
+            name: serverName,
+            api_url: config[serverName].api_url
+        }));
+
+        return {
+            content: [{
+                type: "text",
+                text: JSON.stringify({
+                    servers,
+                    config_path: CONFIG_PATH,
+                    help: "To add more servers, edit the configuration file at the path shown above."
+                }, null, 2)
+            }]
+        };
+    }
+);
+
+server.tool(
+    "strapi_get_content_types",
+    "Retrieves all content type definitions from Strapi. Returns complete content type schemas including field definitions, relationships, and validation rules. Provides comprehensive guides for both REST API and GraphQL usage, with examples of CRUD operations and best practices for data querying.",
+    {
+        server: z.string().describe("The name of the server to connect to")
+    },
+    async (args, extra) => {
+        const server = args.server as string;
+        const data = await makeStrapiRequest(server, "/api/content-type-builder/content-types");
+
+        const response = {
+            data: data,
+            usage_guide: {
+                naming_conventions: {
+                    rest_api: "Use pluralName for REST API endpoints (e.g., 'api/articles' for pluralName: 'articles')",
+                    graphql: {
+                        collections: "Use pluralName for collections (e.g., 'query { articles { data { id } } }')",
+                        single_items: "Use singularName for single items (e.g., 'query { article(id: 1) { data { id } } }')"
+                    }
+                },
+                examples: {
+                    rest: {
+                        collection: "GET /api/{pluralName}",
+                        single: "GET /api/{pluralName}/{id}",
+                        create: "POST /api/{pluralName}",
+                        update: "PUT /api/{pluralName}/{id}",
+                        delete: "DELETE /api/{pluralName}/{id}"
+                    },
+                    graphql: {
+                        collection: "query { pluralName(pagination: { page: 1, pageSize: 100 }) { data { id attributes } } }",
+                        single: "query { singularName(id: 1) { data { id attributes } } }",
+                        create: "mutation { createPluralName(data: { field: value }) { data { id } } }",
+                        update: "mutation { updatePluralName(id: 1, data: { field: value }) { data { id } } }"
+                    }
+                },
+                important_notes: [
+                    "Always check singularName and pluralName in the schema for correct endpoint/query names",
+                    "REST endpoints always start with 'api/'",
+                    "Include pagination in GraphQL collection queries",
+                    "For updates, always fetch current data first and include ALL fields in the update"
+                ]
+            }
+        };
+
+        return {
+            content: [{
+                type: "text",
+                text: JSON.stringify(response, null, 2)
+            }]
+        };
+    }
+);
+
+server.tool(
+    "strapi_get_components",
+    "Fetches all component definitions from Strapi with pagination support. Components are reusable field collections that can be shared across content types. Returns component data along with pagination metadata (page number, items per page, total count, total pages). Essential for understanding the building blocks of your Strapi content structure.",
+    {
+        server: z.string().describe("The name of the server to connect to"),
+        page: z.number().min(1).default(1).describe("Page number (starts at 1)"),
+        pageSize: z.number().min(1).default(25).describe("Number of items per page")
+    },
+    async (args, extra) => {
+        const server = args.server as string;
+        const page = args.page as number;
+        const pageSize = args.pageSize as number;
+
+        const params = {
+            'pagination[page]': page.toString(),
+            'pagination[pageSize]': pageSize.toString(),
+        };
+
+        const data = await makeStrapiRequest(server, "/api/content-type-builder/components", params);
+
+        const response = {
+            data: data,
+            pagination: {
+                page,
+                pageSize,
+                total: data.length,
+                pageCount: Math.ceil(data.length / pageSize),
+            },
+        };
+
+        return {
+            content: [{
+                type: "text",
+                text: JSON.stringify(response, null, 2)
+            }]
+        };
+    }
+);
+
+server.tool(
+    "strapi_rest",
+    "Executes Strapi REST API requests with automatic schema validation. Features: 1) Automatic data validation for write operations, 2) Field type checking, 3) Required field validation, 4) Detailed field-specific error messages. Collection endpoints automatically include pagination (page=1&pageSize=100) and relation population (populate=*). Supports full CRUD operations with built-in data integrity checks.",
+    {
+        server: z.string().describe("The name of the server to connect to"),
+        endpoint: z.string().describe("The API endpoint (e.g., 'api/articles'). Check strapi_get_content_types first to see available endpoints."),
+        method: z.enum(["GET", "POST", "PUT", "DELETE"]).default("GET").describe("HTTP method to use. For write operations (POST/PUT), data is automatically validated against the content type schema."),
+        params: z.record(z.any()).optional().describe("Query parameters (filters, sort, etc.). Use schema from strapi_get_content_types to determine valid fields."),
+        body: z.record(z.any()).optional().describe("Request body for POST/PUT requests. Must match the schema from strapi_get_content_types. Data is automatically validated before sending.")
+    },
+    async (args, extra) => {
+        const server = args.server as string;
+        const endpoint = args.endpoint as string;
+        const method = args.method as string;
+        const params = args.params as Record<string, any> | undefined;
+        const body = args.body as Record<string, any> | undefined;
+
+        const data = await makeRestRequest(server, endpoint, method, params, body);
+        return {
+            content: [{
+                type: "text",
+                text: JSON.stringify(data, null, 2)
+            }]
+        };
+    }
+);
+
+server.tool(
+    "strapi_upload_media",
+    "Uploads media files to Strapi's media library with advanced processing capabilities. Features: 1) URL-based upload support, 2) Format conversion (JPEG/PNG/WebP), 3) Quality control with compression options, 4) Comprehensive metadata management. Returns detailed file information including ID, URL, and integration guides for both REST and GraphQL. Ideal for handling images in content management workflows.",
+    {
+        server: z.string().describe("The name of the server to connect to"),
+        url: z.string().url().describe("URL of the image to upload"),
+        format: z.enum(["jpeg", "png", "webp", "original"]).default("original").describe("Target format for the image. Use 'original' to keep the source format."),
+        quality: z.number().min(1).max(100).default(80).describe("Image quality (1-100). Only applies when converting formats."),
+        metadata: z.object({
+            name: z.string().optional().describe("Name of the file"),
+            caption: z.string().optional().describe("Caption for the image"),
+            alternativeText: z.string().optional().describe("Alternative text for accessibility"),
+            description: z.string().optional().describe("Detailed description of the image")
+        }).optional()
+    },
+    async (args, extra) => {
+        const server = args.server as string;
+        const url = args.url as string;
+        const format = args.format as string;
+        const quality = args.quality as number;
+        const metadata = args.metadata as {
+            name?: string;
+            caption?: string;
+            alternativeText?: string;
+            description?: string;
+        } | undefined;
+
+        const fileName = url.split('/').pop() || 'image';
+        const imageBuffer = await downloadImage(url);
+        const processedBuffer = await processImage(imageBuffer, format, quality);
+        const data = await uploadMedia(server, processedBuffer, fileName, format, metadata);
+
+        const response = {
+            success: true,
+            data: data,
+            image_info: {
+                format: format === 'original' ? 'original (unchanged)' : format,
+                quality: format === 'original' ? 'original (unchanged)' : quality,
+                filename: data[0].name,
+                size: data[0].size,
+                mime: data[0].mime
+            },
+            usage_guide: {
+                file_id: data[0].id,
+                url: data[0].url,
+                how_to_use: {
+                    rest_api: "Use the file ID in your content type's media field",
+                    graphql: "Use the file ID in your GraphQL mutations",
+                    examples: {
+                        rest: `PUT /api/content-type/1 with body: { data: { image: ${data[0].id} } }`,
+                        graphql: `mutation { updateContentType(id: 1, data: { image: ${data[0].id} }) { data { id } } }`
+                    }
+                }
+            }
+        };
+
+        return {
+            content: [{
+                type: "text",
+                text: JSON.stringify(response, null, 2)
+            }]
+        };
+    }
+);
 
 // Cache for content type schemas
 let contentTypeSchemas: Record<string, any> = {};
@@ -266,27 +457,14 @@ async function makeRestRequest(
         }
     }
 
-    // Build query parameters
-    const queryParams = new URLSearchParams();
-
-    // Add pagination for collection endpoints if using GET method
-    if (method === 'GET' && endpoint.startsWith('api/')) {
-        queryParams.append('pagination[page]', '1');
-        queryParams.append('pagination[pageSize]', '100');
-        queryParams.append('populate', '*');
-    }
-
-    // Add additional params
+    // 使用 qs 构建查询参数
     if (params) {
-        Object.entries(params).forEach(([key, value]) => {
-            queryParams.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+        const queryString = qs.stringify(params, {
+            encodeValuesOnly: true // 只编码值而不编码键
         });
-    }
-
-    // Append query string to URL
-    const queryString = queryParams.toString();
-    if (queryString) {
-        url = `${url}?${queryString}`;
+        if (queryString) {
+            url = `${url}?${queryString}`;
+        }
     }
 
     const headers = {
@@ -416,355 +594,6 @@ async function uploadMedia(serverName: string, imageBuffer: Buffer, fileName: st
 
     return handleStrapiError(response, 'Media upload');
 }
-
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-        tools: [
-            {
-                name: "strapi_list_servers",
-                description: "List all available Strapi servers from the configuration.",
-                inputSchema: {
-                    type: "object",
-                    properties: {},
-                    required: [],
-                },
-            },
-            {
-                name: "strapi_get_content_types",
-                description: "Get all content types from Strapi. Returns the complete schema of all content types.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server: {
-                            type: "string",
-                            description: "The name of the server to connect to"
-                        }
-                    },
-                    required: ["server"],
-                },
-            },
-            {
-                name: "strapi_get_components",
-                description: "Get all components from Strapi with pagination support. Returns both component data and pagination metadata (page, pageSize, total, pageCount).",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server: {
-                            type: "string",
-                            description: "The name of the server to connect to"
-                        },
-                        page: {
-                            type: "number",
-                            description: "Page number (starts at 1)",
-                            minimum: 1,
-                            default: 1
-                        },
-                        pageSize: {
-                            type: "number",
-                            description: "Number of items per page",
-                            minimum: 1,
-                            default: 25
-                        },
-                    },
-                    required: ["server"],
-                },
-            },
-            {
-                name: "strapi_rest",
-                description: "Execute REST API requests against Strapi endpoints with automatic schema validation. Features: 1) Automatic schema validation for write operations, 2) Type checking for all fields, 3) Required field validation, 4) Detailed error messages with field-specific feedback. For collection endpoints, pagination is automatically included with page=1&pageSize=100 and populate=* by default to include all relations.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server: {
-                            type: "string",
-                            description: "The name of the server to connect to"
-                        },
-                        endpoint: {
-                            type: "string",
-                            description: "The API endpoint (e.g., 'api/articles'). Check strapi_get_content_types first to see available endpoints.",
-                        },
-                        method: {
-                            type: "string",
-                            enum: ["GET", "POST", "PUT", "DELETE"],
-                            description: "HTTP method to use. For write operations (POST/PUT), data is automatically validated against the content type schema.",
-                            default: "GET"
-                        },
-                        params: {
-                            type: "object",
-                            description: "Query parameters (filters, sort, etc.). Use schema from strapi_get_content_types to determine valid fields.",
-                            additionalProperties: true,
-                        },
-                        body: {
-                            type: "object",
-                            description: "Request body for POST/PUT requests. Must match the schema from strapi_get_content_types. Data is automatically validated before sending.",
-                            additionalProperties: true,
-                        }
-                    },
-                    required: ["server", "endpoint"],
-                },
-            },
-            {
-                name: "strapi_upload_media",
-                description: "Upload media to Strapi's media library from a URL with format conversion, quality control, and metadata options. Returns the uploaded file information including the ID for future reference.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        server: {
-                            type: "string",
-                            description: "The name of the server to connect to"
-                        },
-                        url: {
-                            type: "string",
-                            description: "URL of the image to upload"
-                        },
-                        format: {
-                            type: "string",
-                            enum: ["jpeg", "png", "webp", "original"],
-                            description: "Target format for the image. Use 'original' to keep the source format.",
-                            default: "original"
-                        },
-                        quality: {
-                            type: "number",
-                            description: "Image quality (1-100). Only applies when converting formats.",
-                            minimum: 1,
-                            maximum: 100,
-                            default: 80
-                        },
-                        metadata: {
-                            type: "object",
-                            properties: {
-                                name: {
-                                    type: "string",
-                                    description: "Name of the file"
-                                },
-                                caption: {
-                                    type: "string",
-                                    description: "Caption for the image"
-                                },
-                                alternativeText: {
-                                    type: "string",
-                                    description: "Alternative text for accessibility"
-                                },
-                                description: {
-                                    type: "string",
-                                    description: "Detailed description of the image"
-                                }
-                            }
-                        }
-                    },
-                    required: ["server", "url"]
-                }
-            }
-        ],
-    };
-});
-
-// Handle tool execution
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-
-    try {
-        if (name === "strapi_list_servers") {
-            if (Object.keys(config).length === 0) {
-                const exampleConfig = {
-                    "myserver": {
-                        "api_url": "http://localhost:1337",
-                        "api_key": "your-jwt-token-from-strapi-admin"
-                    }
-                };
-
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: JSON.stringify({
-                                error: "No servers configured",
-                                help: {
-                                    message: "No server configuration found. Please create a configuration file.",
-                                    config_path: CONFIG_PATH,
-                                    example_config: exampleConfig,
-                                    setup_steps: [
-                                        "Create the .mcp directory: mkdir -p ~/.mcp",
-                                        "Create the config file: touch ~/.mcp/strapi-mcp-server.config.json",
-                                        "Add your server configuration using the example above",
-                                        "Get your JWT token from Strapi Admin Panel > Settings > API Tokens",
-                                        "Make sure the file permissions are secure: chmod 600 ~/.mcp/strapi-mcp-server.config.json"
-                                    ]
-                                }
-                            }, null, 2),
-                        },
-                    ],
-                };
-            }
-
-            const servers = Object.keys(config).map(serverName => ({
-                name: serverName,
-                api_url: config[serverName].api_url
-            }));
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            servers,
-                            config_path: CONFIG_PATH,
-                            help: "To add more servers, edit the configuration file at the path shown above."
-                        }, null, 2),
-                    },
-                ],
-            };
-        } else if (name === "strapi_get_content_types") {
-            const { server } = args as { server: string };
-            const data = await makeStrapiRequest(server, "/api/content-type-builder/content-types");
-
-            // Add helpful usage information to the response
-            const response = {
-                data: data,
-                usage_guide: {
-                    naming_conventions: {
-                        rest_api: "Use pluralName for REST API endpoints (e.g., 'api/articles' for pluralName: 'articles')",
-                        graphql: {
-                            collections: "Use pluralName for collections (e.g., 'query { articles { data { id } } }')",
-                            single_items: "Use singularName for single items (e.g., 'query { article(id: 1) { data { id } } }')"
-                        }
-                    },
-                    examples: {
-                        rest: {
-                            collection: "GET /api/{pluralName}",
-                            single: "GET /api/{pluralName}/{id}",
-                            create: "POST /api/{pluralName}",
-                            update: "PUT /api/{pluralName}/{id}",
-                            delete: "DELETE /api/{pluralName}/{id}"
-                        },
-                        graphql: {
-                            collection: "query { pluralName(pagination: { page: 1, pageSize: 100 }) { data { id attributes } } }",
-                            single: "query { singularName(id: 1) { data { id attributes } } }",
-                            create: "mutation { createPluralName(data: { field: value }) { data { id } } }",
-                            update: "mutation { updatePluralName(id: 1, data: { field: value }) { data { id } } }"
-                        }
-                    },
-                    important_notes: [
-                        "Always check singularName and pluralName in the schema for correct endpoint/query names",
-                        "REST endpoints always start with 'api/'",
-                        "Include pagination in GraphQL collection queries",
-                        "For updates, always fetch current data first and include ALL fields in the update"
-                    ]
-                }
-            };
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(response, null, 2),
-                    },
-                ],
-            };
-        } else if (name === "strapi_get_components") {
-            const { server, page, pageSize } = args as { server: string, page: number, pageSize: number };
-            const params = {
-                'pagination[page]': page.toString(),
-                'pagination[pageSize]': pageSize.toString(),
-            };
-
-            const data = await makeStrapiRequest(server, "/api/content-type-builder/components", params);
-
-            // Add pagination metadata to the response
-            const response = {
-                data: data,
-                pagination: {
-                    page,
-                    pageSize,
-                    total: data.length,
-                    pageCount: Math.ceil(data.length / pageSize),
-                },
-            };
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(response, null, 2),
-                    },
-                ],
-            };
-        } else if (name === "strapi_rest") {
-            const { server, endpoint, method, params, body } = args as { server: string, endpoint: string, method: string, params?: Record<string, any>, body?: Record<string, any> };
-            const data = await makeRestRequest(server, endpoint, method, params, body);
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(data, null, 2),
-                    },
-                ],
-            };
-        } else if (name === "strapi_upload_media") {
-            const { server, url, format, quality, metadata } = args as { server: string, url: string, format: string, quality: number, metadata?: Record<string, any> };
-
-            // Extract filename from URL
-            const fileName = url.split('/').pop() || 'image';
-
-            // Download the image
-            const imageBuffer = await downloadImage(url);
-
-            // Process the image if format conversion is requested
-            const processedBuffer = await processImage(imageBuffer, format, quality);
-
-            // Upload to Strapi with metadata
-            const data = await uploadMedia(server, processedBuffer, fileName, format, metadata);
-
-            // Format response with helpful usage information
-            const response = {
-                success: true,
-                data: data,
-                image_info: {
-                    format: format === 'original' ? 'original (unchanged)' : format,
-                    quality: format === 'original' ? 'original (unchanged)' : quality,
-                    filename: data[0].name,
-                    size: data[0].size,
-                    mime: data[0].mime
-                },
-                usage_guide: {
-                    file_id: data[0].id,
-                    url: data[0].url,
-                    how_to_use: {
-                        rest_api: "Use the file ID in your content type's media field",
-                        graphql: "Use the file ID in your GraphQL mutations",
-                        examples: {
-                            rest: "PUT /api/content-type/1 with body: { data: { image: " + data[0].id + " } }",
-                            graphql: "mutation { updateContentType(id: 1, data: { image: " + data[0].id + " }) { data { id } } }"
-                        }
-                    }
-                }
-            };
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(response, null, 2)
-                    }
-                ]
-            };
-        } else {
-            throw new Error(`Unknown tool: ${name}`);
-        }
-    } catch (error: unknown) {
-        console.error("Error executing tool:", error);
-        const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${errorMessage}`,
-                },
-            ],
-        };
-    }
-});
 
 // Start the server
 async function main() {
